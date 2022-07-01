@@ -57,6 +57,7 @@ const collectMetricsMarker = `[ -z "COLLECT_METRICS" ] && `
 
 var (
 	kopiaExe            = flag.String("kopia-exe", os.ExpandEnv("$HOME/go/bin/kopia"), "Path to kopia")
+	compareExe          = flag.String("compare-to-exe", "", "Path to executable to compare against")
 	runTags             = flag.String("run-tags", "", "Comma-separated list of tags to attach to measurements")
 	repoPath            = flag.String("repo-path", "/tmp/kopia-test-repo", "Path to repository directory")
 	outputDir           = flag.String("output-dir", "/tmp/kopia-benchmark-outputs", "Output directory")
@@ -242,10 +243,10 @@ func runCommandAndSample(ctx context.Context, c *exec.Cmd, timeOffset time.Durat
 	return rr, runErr
 }
 
-func run(ctx context.Context, timeOffset time.Duration, exe string, args ...string) (*runResult, error) {
+func runKopia(ctx context.Context, timeOffset time.Duration, exe string, args ...string) (*runResult, error) {
 	c := exec.CommandContext(ctx, exe, append([]string{"--metrics-listen-addr=:6666"}, args...)...)
 	c.Env = append(append([]string(nil), os.Environ()...),
-		"KOPIA_EXE="+*kopiaExe,
+		"KOPIA_EXE="+exe,
 		"REPO_PATH="+*repoPath,
 	)
 
@@ -267,7 +268,20 @@ func runPrepare(ctx context.Context, scenarioFile string) error {
 	return errors.Wrapf(err, "failed with %s", out)
 }
 
-func logSamples(f io.Writer, scen string, rrs []*runResult) {
+type runSummary struct {
+	avgCPU float64
+	maxCPU float64
+	avgRAM float64
+	maxRAM float64
+
+	avgRepoSize    float64
+	avgFileCount   float64
+	avgDuration    float64
+	avgHeapObjects float64
+	avgHeapBytes   float64
+}
+
+func summarizeSamples(rrs []*runResult) runSummary {
 	var (
 		totalCPU         float64
 		totalRAM         float64
@@ -304,14 +318,56 @@ func logSamples(f io.Writer, scen string, rrs []*runResult) {
 		}
 	}
 
-	avgCPU := totalCPU / float64(cnt)
-	avgRAM := totalRAM / float64(cnt)
+	return runSummary{
+		avgCPU: totalCPU / float64(cnt),
+		maxCPU: maxCPU,
+		avgRAM: totalRAM / float64(cnt),
+		maxRAM: maxRAM,
 
-	avgRepoSize := totalRepoSize / float64(len(rrs))
-	avgFileCount := totalFiles / float64(len(rrs))
-	avgDuration := totalDuration / float64(len(rrs))
-	avgHeapObjects := totalHeapObjects / float64(len(rrs))
-	avgHeapBytes := totalHeapBytes / float64(len(rrs))
+		avgRepoSize:    totalRepoSize / float64(len(rrs)),
+		avgFileCount:   totalFiles / float64(len(rrs)),
+		avgDuration:    totalDuration / float64(len(rrs)),
+		avgHeapObjects: totalHeapObjects / float64(len(rrs)),
+		avgHeapBytes:   totalHeapBytes / float64(len(rrs)),
+	}
+}
+
+func compareValues(current, baseline float64) string {
+	v := current / baseline
+
+	var percentageChange string
+	if v > 1 {
+		percentageChange = fmt.Sprintf("+%.1f %%", 100*(v-1))
+	} else if v < 1 {
+		percentageChange = fmt.Sprintf("-%.1f %%", 100*(1-v))
+	} else {
+		percentageChange = "0%"
+	}
+
+	return fmt.Sprintf(" current:%.1f baseline:%.1f change:%v", current, baseline, percentageChange)
+}
+
+func compareSamples(f io.Writer, scen string, rrs, baseline []*runResult) {
+	summ := summarizeSamples(rrs)
+	summ2 := summarizeSamples(baseline)
+
+	//fmt.Fprintf(f, "duration:,repo_size=%v,num_files=%v %v\n",
+	fmt.Fprintf(f, "duration:%v\n", compareValues(summ.avgDuration, summ2.avgDuration))
+	fmt.Fprintf(f, "repo_size:%v\n", compareValues(summ.avgRepoSize, summ2.avgRepoSize))
+	fmt.Fprintf(f, "num_files:%v\n", compareValues(summ.avgFileCount, summ2.avgFileCount))
+
+	fmt.Fprintf(f, "avg_heap_objects:%v\n", compareValues(summ.avgHeapObjects, summ2.avgHeapObjects))
+	fmt.Fprintf(f, "avg_heap_bytes:%v\n", compareValues(summ.avgHeapBytes, summ2.avgHeapBytes))
+
+	fmt.Fprintf(f, "avg_ram:%v\n", compareValues(summ.avgRAM, summ2.avgRAM))
+	fmt.Fprintf(f, "max_ram:%v\n", compareValues(summ.maxRAM, summ2.maxRAM))
+
+	fmt.Fprintf(f, "avg_cpu:%v\n", compareValues(summ.avgCPU, summ2.avgCPU))
+	fmt.Fprintf(f, "max_cpu:%v\n", compareValues(summ.maxCPU, summ2.maxCPU))
+}
+
+func logSamples(f io.Writer, scen string, rrs []*runResult) {
+	summ := summarizeSamples(rrs)
 
 	// log.Printf("dur: %v CPU avg:%.1f max:%.1f RAM avg:%.1f max:%.1f", rr.duration, totalCPU/float64(len(rr.samples)), maxCPU, float64(totalRAM)/((1<<20)*float64(len(rr.samples))), float64(maxRAM)/float64((1<<20)))
 
@@ -328,29 +384,29 @@ func logSamples(f io.Writer, scen string, rrs []*runResult) {
 
 	fmt.Fprintf(f, "process_summary,%v duration=%.1f,repo_size=%v,num_files=%v %v\n",
 		tags,
-		avgDuration,
-		avgRepoSize,
-		avgFileCount,
+		summ.avgDuration,
+		summ.avgRepoSize,
+		summ.avgFileCount,
 		gitTime.UnixNano(),
 	)
 
 	fmt.Fprintf(f, "process_heap_summary,%v avg_heap_objects=%v,avg_heap_bytes=%v %v\n",
 		tags,
-		avgHeapObjects,
-		avgHeapBytes,
+		summ.avgHeapObjects,
+		summ.avgHeapBytes,
 		gitTime.UnixNano(),
 	)
 	fmt.Fprintf(f, "process_ram_summary,%v avg_ram_rss=%v,max_ram_rss=%v %v\n",
 		tags,
-		avgRAM,
-		maxRAM,
+		summ.avgRAM,
+		summ.maxRAM,
 		gitTime.UnixNano(),
 	)
 
 	fmt.Fprintf(f, "process_cpu_summary,%v avg_cpu_percent=%v,max_cpu_percent=%v %v\n",
 		tags,
-		avgCPU,
-		maxCPU,
+		summ.avgCPU,
+		summ.maxCPU,
 		gitTime.UnixNano(),
 	)
 }
@@ -430,6 +486,35 @@ func parseBuildInfo() {
 	}
 }
 
+func runMultiple(ctx context.Context, scenFile string, timeOffset time.Duration, exe string, args []string) []*runResult {
+	var (
+		runs          []*runResult
+		totalDuration time.Duration
+		totalCount    int
+	)
+
+	for totalDuration < *minDuration || totalCount < *minRepeat {
+		log.Printf("Run #%v (%v), total duration %v", totalCount+1, exe, totalDuration)
+		log.Printf("  preparing...")
+		failOnError(runPrepare(ctx, scenFile))
+		log.Printf("  running...")
+		t0 := time.Now()
+		rr, err := runKopia(ctx, timeOffset, exe, args...)
+		failOnError(err)
+
+		if totalCount > 0 {
+			// discard first result as a warmup
+			runs = append(runs, rr)
+		}
+
+		totalDuration += time.Since(t0)
+		totalCount++
+		log.Printf("  completed in %v dir size: %v allocated bytes %v allocated objects: %v", rr.duration, rr.repoSizeBytes, int64(rr.go_memstats_alloc_bytes_total), int64(rr.go_memstats_mallocs_total))
+	}
+
+	return runs
+}
+
 func main() {
 	flag.Parse()
 
@@ -452,8 +537,6 @@ func main() {
 	for _, scenFile := range flag.Args() {
 		scen := strings.TrimSuffix(filepath.Base(scenFile), ".sh")
 
-		var runs []*runResult
-
 		outputFile := filepath.Join(*outputDir, scen, gitTime.UTC().Format("2006-01-02_150405")+"-"+gitRevision+".line")
 
 		log.Printf("Running benchmark:")
@@ -462,7 +545,7 @@ func main() {
 		log.Printf("   revision %q (%v) modified:%v", gitRevision, gitTime, gitModified)
 		log.Printf("   output file %q", outputFile)
 
-		if _, err := os.Stat(outputFile); err == nil && !*force {
+		if _, err := os.Stat(outputFile); err == nil && !*force && *compareExe == "" {
 			log.Println("output already exists and --force not passed")
 			continue
 		}
@@ -474,28 +557,13 @@ func main() {
 		// so that runs for a given time are clustered around it.
 		timeOffset := time.Until(gitTime)
 
-		var (
-			totalDuration time.Duration
-			totalCount    int
-		)
+		runs := runMultiple(ctx, scenFile, timeOffset, exe, args)
+		if *compareExe != "" {
+			compareRuns := runMultiple(ctx, scenFile, timeOffset, *compareExe, args)
 
-		for totalDuration < *minDuration || totalCount < *minRepeat {
-			log.Printf("Run #%v, total duration %v", totalCount+1, totalDuration)
-			log.Printf("  preparing...")
-			failOnError(runPrepare(ctx, scenFile))
-			log.Printf("  running...")
-			t0 := time.Now()
-			rr, err := run(ctx, timeOffset, exe, args...)
-			failOnError(err)
+			compareSamples(os.Stdout, scen, runs, compareRuns)
 
-			if totalCount > 0 {
-				// discard first result as a warmup
-				runs = append(runs, rr)
-			}
-
-			totalDuration += time.Since(t0)
-			totalCount++
-			log.Printf("  completed in %v dir size: %v allocated bytes %v allocated objects: %v", rr.duration, rr.repoSizeBytes, int64(rr.go_memstats_alloc_bytes_total), int64(rr.go_memstats_mallocs_total))
+			continue
 		}
 
 		if outputFile != "" {
