@@ -10,7 +10,7 @@
 // Each scenario file is a simple bash script that prepares the test, it must contain exactly
 // one line starting with:
 //
-//   [ -z "COLLECT_METRICS" ] &&
+//	[ -z "COLLECT_METRICS" ] &&
 //
 // This prefix prevents the command from running as part of bash script and allows the tool
 // to parse it and run separately with metric collection.
@@ -21,7 +21,6 @@
 // <outputDir>/<scenario>/<gitTime>-<gitHash>.line
 //
 // This can be imported into InfluxDB using `influx write --file=<path>`
-//
 package main
 
 import (
@@ -33,6 +32,7 @@ import (
 	"io"
 	stdlog "log"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -41,8 +41,6 @@ import (
 	"sync"
 	"time"
 
-	"cloud.google.com/go/compute/metadata"
-	"cloud.google.com/go/logging"
 	"github.com/google/shlex"
 	"github.com/pkg/errors"
 	"github.com/shirou/gopsutil/v3/process"
@@ -55,17 +53,20 @@ var log = stdlog.Default()
 // command to collect metrics for.
 const collectMetricsMarker = `[ -z "COLLECT_METRICS" ] && `
 
+// marker that can be put in a script to indicate that the benchmark can share single preparation phase.
+const singlePrepareMarker = `# SINGLE_PREPARE`
+
 var (
-	kopiaExe            = flag.String("kopia-exe", os.ExpandEnv("$HOME/go/bin/kopia"), "Path to kopia")
-	compareExe          = flag.String("compare-to-exe", "", "Path to executable to compare against")
-	runTags             = flag.String("run-tags", "", "Comma-separated list of tags to attach to measurements")
-	repoPath            = flag.String("repo-path", "/tmp/kopia-test-repo", "Path to repository directory")
-	outputDir           = flag.String("output-dir", "/tmp/kopia-benchmark-outputs", "Output directory")
-	timestamp           = flag.Int64("timestamp", 0, "Override benchmark timestamp")
-	force               = flag.Bool("force", false, "Force run even if output already exists")
-	minDuration         = flag.Duration("min-duration", 2*time.Minute, "Repeat scenarios until they run for a given minum time")
-	minRepeat           = flag.Int("min-repeat", 2, "Repeat scenarios a given minum number of times")
-	disableCloudLogging = flag.Bool("disable-cloud-logging", false, "Disable cloud logging")
+	kopiaExe    = flag.String("kopia-exe", os.ExpandEnv("$HOME/go/bin/kopia"), "Path to kopia")
+	compareExe  = flag.String("compare-to-exe", "", "Path to executable to compare against")
+	runTags     = flag.String("run-tags", "", "Comma-separated list of tags to attach to measurements")
+	repoPath    = flag.String("repo-path", "/tmp/kopia-test-repo", "Path to repository directory")
+	outputDir   = flag.String("output-dir", "/tmp/kopia-benchmark-outputs", "Output directory")
+	timestamp   = flag.Int64("timestamp", 0, "Override benchmark timestamp")
+	force       = flag.Bool("force", false, "Force run even if output already exists")
+	minDuration = flag.Duration("min-duration", 2*time.Minute, "Repeat scenarios until they run for a given minum time")
+	minRepeat   = flag.Int("min-repeat", 3, "Repeat scenarios a given minum number of times")
+	goExe       = flag.String("go-exe", "go", "Path to go executable")
 )
 
 var (
@@ -244,7 +245,17 @@ func runCommandAndSample(ctx context.Context, c *exec.Cmd, timeOffset time.Durat
 }
 
 func runKopia(ctx context.Context, timeOffset time.Duration, exe string, args ...string) (*runResult, error) {
-	c := exec.CommandContext(ctx, exe, append([]string{"--metrics-listen-addr=:6666"}, args...)...)
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		log.Printf("received %v %v %v", r.Method, r.RequestURI, r.ContentLength)
+
+		io.Copy(os.Stderr, r.Body)
+	}))
+
+	c := exec.CommandContext(ctx, exe, append([]string{
+		"--metrics-listen-addr=:6666",
+		"--metrics-push-addr=" + s.URL,
+		"--metrics-push-format=text",
+	}, args...)...)
 	c.Env = append(append([]string(nil), os.Environ()...),
 		"KOPIA_EXE="+exe,
 		"REPO_PATH="+*repoPath,
@@ -351,19 +362,18 @@ func compareSamples(f io.Writer, scen string, rrs, baseline []*runResult) {
 	summ := summarizeSamples(rrs)
 	summ2 := summarizeSamples(baseline)
 
-	//fmt.Fprintf(f, "duration:,repo_size=%v,num_files=%v %v\n",
-	fmt.Fprintf(f, "duration:%v\n", compareValues(summ.avgDuration, summ2.avgDuration))
-	fmt.Fprintf(f, "repo_size:%v\n", compareValues(summ.avgRepoSize, summ2.avgRepoSize))
-	fmt.Fprintf(f, "num_files:%v\n", compareValues(summ.avgFileCount, summ2.avgFileCount))
+	fmt.Fprintf(f, "DIFF duration:%v\n", compareValues(summ.avgDuration, summ2.avgDuration))
+	fmt.Fprintf(f, "DIFF repo_size:%v\n", compareValues(summ.avgRepoSize, summ2.avgRepoSize))
+	fmt.Fprintf(f, "DIFF num_files:%v\n", compareValues(summ.avgFileCount, summ2.avgFileCount))
 
-	fmt.Fprintf(f, "avg_heap_objects:%v\n", compareValues(summ.avgHeapObjects, summ2.avgHeapObjects))
-	fmt.Fprintf(f, "avg_heap_bytes:%v\n", compareValues(summ.avgHeapBytes, summ2.avgHeapBytes))
+	fmt.Fprintf(f, "DIFF avg_heap_objects:%v\n", compareValues(summ.avgHeapObjects, summ2.avgHeapObjects))
+	fmt.Fprintf(f, "DIFF avg_heap_bytes:%v\n", compareValues(summ.avgHeapBytes, summ2.avgHeapBytes))
 
-	fmt.Fprintf(f, "avg_ram:%v\n", compareValues(summ.avgRAM, summ2.avgRAM))
-	fmt.Fprintf(f, "max_ram:%v\n", compareValues(summ.maxRAM, summ2.maxRAM))
+	fmt.Fprintf(f, "DIFF avg_ram:%v\n", compareValues(summ.avgRAM, summ2.avgRAM))
+	fmt.Fprintf(f, "DIFF max_ram:%v\n", compareValues(summ.maxRAM, summ2.maxRAM))
 
-	fmt.Fprintf(f, "avg_cpu:%v\n", compareValues(summ.avgCPU, summ2.avgCPU))
-	fmt.Fprintf(f, "max_cpu:%v\n", compareValues(summ.maxCPU, summ2.maxCPU))
+	fmt.Fprintf(f, "DIFF avg_cpu:%v\n", compareValues(summ.avgCPU, summ2.avgCPU))
+	fmt.Fprintf(f, "DIFF max_cpu:%v\n", compareValues(summ.maxCPU, summ2.maxCPU))
 }
 
 func logSamples(f io.Writer, scen string, rrs []*runResult) {
@@ -411,24 +421,28 @@ func logSamples(f io.Writer, scen string, rrs []*runResult) {
 	)
 }
 
-func parseScenario(fname string) (string, []string, error) {
+func parseScenario(fname string) (string, []string, bool, error) {
 	f, err := os.Open(fname)
 	if err != nil {
-		return "", nil, err
+		return "", nil, false, err
 	}
 	defer f.Close()
 
 	var lines []string
+	singlePrepare := false
 
 	s := bufio.NewScanner(f)
 	for s.Scan() {
 		if strings.HasPrefix(s.Text(), collectMetricsMarker) {
 			lines = append(lines, strings.TrimPrefix(s.Text(), collectMetricsMarker))
 		}
+		if strings.HasPrefix(s.Text(), singlePrepareMarker) {
+			singlePrepare = true
+		}
 	}
 
 	if len(lines) != 1 {
-		return "", nil, errors.Errorf("expected %q to have exactly one line, got %v", fname, len(lines))
+		return "", nil, false, errors.Errorf("expected %q to have exactly one line, got %v", fname, len(lines))
 	}
 
 	expanded := strings.ReplaceAll(lines[0], "$KOPIA_EXE", *kopiaExe)
@@ -437,10 +451,10 @@ func parseScenario(fname string) (string, []string, error) {
 
 	parts, err := shlex.Split(expanded)
 	if err != nil {
-		return "", nil, errors.Wrap(err, "unable to split")
+		return "", nil, false, errors.Wrap(err, "unable to split")
 	}
 
-	return parts[0], parts[1:], nil
+	return parts[0], parts[1:], singlePrepare, nil
 }
 
 func failOnError(err error) {
@@ -450,7 +464,7 @@ func failOnError(err error) {
 }
 
 func parseBuildInfo() {
-	c := exec.Command("go", "version", "-m", *kopiaExe)
+	c := exec.Command(*goExe, "version", "-m", *kopiaExe)
 	o, err := c.Output()
 	failOnError(errors.Wrap(err, "unable to run go version"))
 	s := bufio.NewScanner(bytes.NewReader(o))
@@ -486,7 +500,7 @@ func parseBuildInfo() {
 	}
 }
 
-func runMultiple(ctx context.Context, scenFile string, timeOffset time.Duration, exe string, args []string) []*runResult {
+func runMultiple(ctx context.Context, scenFile string, timeOffset time.Duration, exe string, args []string, singlePrepare bool) []*runResult {
 	var (
 		runs          []*runResult
 		totalDuration time.Duration
@@ -495,8 +509,11 @@ func runMultiple(ctx context.Context, scenFile string, timeOffset time.Duration,
 
 	for totalDuration < *minDuration || totalCount < *minRepeat {
 		log.Printf("Run #%v (%v), total duration %v", totalCount+1, exe, totalDuration)
-		log.Printf("  preparing...")
-		failOnError(runPrepare(ctx, scenFile))
+		if totalCount == 0 || !singlePrepare {
+			log.Printf("  preparing...")
+			failOnError(runPrepare(ctx, scenFile))
+		}
+
 		log.Printf("  running...")
 		t0 := time.Now()
 		rr, err := runKopia(ctx, timeOffset, exe, args...)
@@ -520,18 +537,6 @@ func main() {
 
 	ctx := context.Background()
 
-	// when running on GCP publish logs to Cloud Logging
-	if cloudProject, _ := metadata.ProjectID(); cloudProject != "" && !*disableCloudLogging {
-		client, err := logging.NewClient(ctx, cloudProject)
-		if err != nil {
-			log.Fatalf("Failed to create client: %v", err)
-		}
-		defer client.Close()
-
-		logName := "runbench"
-		log = client.Logger(logName).StandardLogger(logging.Info)
-	}
-
 	parseBuildInfo()
 
 	for _, scenFile := range flag.Args() {
@@ -550,16 +555,16 @@ func main() {
 			continue
 		}
 
-		exe, args, err := parseScenario(scenFile)
+		exe, args, singlePrepare, err := parseScenario(scenFile)
 		failOnError(err)
 
 		// compute offset such that now + offset == gitTime
 		// so that runs for a given time are clustered around it.
 		timeOffset := time.Until(gitTime)
 
-		runs := runMultiple(ctx, scenFile, timeOffset, exe, args)
+		runs := runMultiple(ctx, scenFile, timeOffset, exe, args, singlePrepare)
 		if *compareExe != "" {
-			compareRuns := runMultiple(ctx, scenFile, timeOffset, *compareExe, args)
+			compareRuns := runMultiple(ctx, scenFile, timeOffset, *compareExe, args, singlePrepare)
 
 			compareSamples(os.Stdout, scen, runs, compareRuns)
 
