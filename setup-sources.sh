@@ -6,7 +6,7 @@ MAKEMANYFILES=~/go/bin/makemanyfiles
 RUNBENCH=~/go/bin/runbench
 
 setup_packages() {
-	sudo apt install -y axel golang-1.21-go make
+	sudo apt install -y axel golang-1.21-go
 }
 
 setup_tools() {

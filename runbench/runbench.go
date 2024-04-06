@@ -248,7 +248,7 @@ func runKopia(ctx context.Context, timeOffset time.Duration, exe string, args ..
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("received %v %v %v", r.Method, r.RequestURI, r.ContentLength)
 
-		_, _ = io.Copy(os.Stderr, r.Body)
+		//_, _ = io.Copy(os.Stderr, r.Body)
 	}))
 
 	c := exec.CommandContext(ctx, exe, append([]string{
