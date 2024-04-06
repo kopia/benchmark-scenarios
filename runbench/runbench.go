@@ -248,7 +248,7 @@ func runKopia(ctx context.Context, timeOffset time.Duration, exe string, args ..
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("received %v %v %v", r.Method, r.RequestURI, r.ContentLength)
 
-		io.Copy(os.Stderr, r.Body)
+		_, _ = io.Copy(os.Stderr, r.Body)
 	}))
 
 	c := exec.CommandContext(ctx, exe, append([]string{
@@ -358,7 +358,7 @@ func compareValues(current, baseline float64) string {
 	return fmt.Sprintf(" current:%.1f baseline:%.1f change:%v", current, baseline, percentageChange)
 }
 
-func compareSamples(f io.Writer, scen string, rrs, baseline []*runResult) {
+func compareSamples(f io.Writer, rrs, baseline []*runResult) {
 	summ := summarizeSamples(rrs)
 	summ2 := summarizeSamples(baseline)
 
@@ -564,9 +564,9 @@ func main() {
 
 		runs := runMultiple(ctx, scenFile, timeOffset, exe, args, singlePrepare)
 		if *compareExe != "" {
-			compareRuns := runMultiple(ctx, scenFile, timeOffset, *compareExe, args, singlePrepare)
+			comparedResult := runMultiple(ctx, scenFile, timeOffset, *compareExe, args, singlePrepare)
 
-			compareSamples(os.Stdout, scen, runs, compareRuns)
+			compareSamples(os.Stdout, runs, comparedResult)
 
 			continue
 		}
