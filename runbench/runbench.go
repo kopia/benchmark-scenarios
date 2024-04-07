@@ -75,11 +75,15 @@ var (
 	gitModified bool
 )
 
-type sample struct {
-	ts                time.Time
-	ram               float64 // MiB
-	cpu               float64
-	prometheusMetrics []byte
+type externalSample struct {
+	ts  time.Time
+	ram float64 // MiB
+	cpu float64
+}
+
+type prometheusSample struct {
+	ts     time.Time
+	values map[string]float64
 }
 
 type runResult struct {
@@ -92,7 +96,8 @@ type runResult struct {
 	go_memstats_alloc_bytes_total float64
 	go_memstats_mallocs_total     float64
 
-	samples []*sample
+	externalSamples []*externalSample
+	promSamples     []*prometheusSample
 }
 
 func summarizeDir(dir string, numFiles *int, totalSize *int64) error {
@@ -150,7 +155,35 @@ func parsePrometheusCounters(b []byte) map[string]float64 {
 	return res
 }
 
-func runCommandAndSample(ctx context.Context, c *exec.Cmd, timeOffset time.Duration) (*runResult, error) {
+func runKopia(ctx context.Context, timeOffset time.Duration, exe string, args ...string) (*runResult, error) {
+	var promSamples []*prometheusSample
+
+	// start a server to which Kopia will be pushing Prometheus metrics
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" && strings.HasPrefix(r.RequestURI, "/metrics") {
+			b, err := io.ReadAll(r.Body)
+			if err == nil {
+				promSamples = append(promSamples, &prometheusSample{
+					ts:     time.Now(),
+					values: parsePrometheusCounters(b),
+				})
+			}
+		}
+	}))
+
+	// prepare and start Kopia
+	c := exec.CommandContext(ctx, exe, append([]string{
+		"--metrics-push-addr=" + s.URL,
+		"--metrics-push-format=text",
+	}, args...)...)
+	c.Env = append(append([]string(nil), os.Environ()...),
+		"KOPIA_EXE="+exe,
+		"REPO_PATH="+*repoPath,
+	)
+
+	c.Stdout = os.Stdout
+	c.Stderr = os.Stderr
+
 	t0 := time.Now()
 
 	err := c.Start()
@@ -176,10 +209,11 @@ func runCommandAndSample(ctx context.Context, c *exec.Cmd, timeOffset time.Durat
 		return nil, errors.Wrap(err, "unable to attach to process")
 	}
 
-	var samples []*sample
+	var samples []*externalSample
 
+	// run Kopia and collect CPU and memory samples.
 	for {
-		s := &sample{
+		s := &externalSample{
 			ts: time.Now().Add(timeOffset),
 		}
 
@@ -195,12 +229,6 @@ func runCommandAndSample(ctx context.Context, c *exec.Cmd, timeOffset time.Durat
 
 		s.cpu = cpuPercent
 		s.ram = float64(mi.RSS) / (1 << 20)
-
-		resp, err := http.Get("http://localhost:6666/metrics")
-		if err == nil {
-			s.prometheusMetrics, _ = io.ReadAll(resp.Body)
-			resp.Body.Close()
-		}
 
 		samples = append(samples, s)
 
@@ -223,20 +251,19 @@ func runCommandAndSample(ctx context.Context, c *exec.Cmd, timeOffset time.Durat
 	}
 
 	rr := &runResult{
-		samples:       samples,
-		duration:      dur,
-		numRepoFiles:  numFiles,
-		repoSizeBytes: totalSize,
+		duration:        dur,
+		numRepoFiles:    numFiles,
+		repoSizeBytes:   totalSize,
+		externalSamples: samples,
+		promSamples:     promSamples,
 	}
 
-	for _, s := range samples {
-		counters := parsePrometheusCounters(s.prometheusMetrics)
-
-		if v := counters["go_memstats_alloc_bytes_total"]; v > 0 {
+	for _, s := range promSamples {
+		if v := s.values["go_memstats_alloc_bytes_total"]; v > 0 {
 			rr.go_memstats_alloc_bytes_total = v
 		}
 
-		if v := counters["go_memstats_mallocs_total"]; v > 0 {
+		if v := s.values["go_memstats_mallocs_total"]; v > 0 {
 			rr.go_memstats_mallocs_total = v
 		}
 	}
@@ -244,30 +271,7 @@ func runCommandAndSample(ctx context.Context, c *exec.Cmd, timeOffset time.Durat
 	return rr, runErr
 }
 
-func runKopia(ctx context.Context, timeOffset time.Duration, exe string, args ...string) (*runResult, error) {
-	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("received %v %v %v", r.Method, r.RequestURI, r.ContentLength)
-
-		//_, _ = io.Copy(os.Stderr, r.Body)
-	}))
-
-	c := exec.CommandContext(ctx, exe, append([]string{
-		"--metrics-listen-addr=:6666",
-		"--metrics-push-addr=" + s.URL,
-		"--metrics-push-format=text",
-	}, args...)...)
-	c.Env = append(append([]string(nil), os.Environ()...),
-		"KOPIA_EXE="+exe,
-		"REPO_PATH="+*repoPath,
-	)
-
-	c.Stdout = os.Stdout
-	c.Stderr = os.Stderr
-
-	return runCommandAndSample(ctx, c, timeOffset)
-}
-
-func runPrepare(ctx context.Context, scenarioFile string) error {
+func runPrepare(scenarioFile string) error {
 	c := exec.Command(scenarioFile)
 	c.Env = append(append([]string(nil), os.Environ()...),
 		"KOPIA_EXE="+*kopiaExe,
@@ -313,7 +317,7 @@ func summarizeSamples(rrs []*runResult) runSummary {
 		totalHeapObjects += float64(rr.go_memstats_mallocs_total)
 		totalHeapBytes += float64(rr.go_memstats_alloc_bytes_total)
 
-		for _, s := range rr.samples {
+		for _, s := range rr.externalSamples {
 			totalCPU += s.cpu
 			totalRAM += float64(s.ram)
 
@@ -470,6 +474,9 @@ func parseBuildInfo() {
 	s := bufio.NewScanner(bytes.NewReader(o))
 	for s.Scan() {
 		fields := strings.Fields(s.Text())
+		if len(fields) == 0 {
+			continue
+		}
 
 		if len(fields) != 2 && fields[0] != "build" {
 			continue
@@ -511,7 +518,7 @@ func runMultiple(ctx context.Context, scenFile string, timeOffset time.Duration,
 		log.Printf("Run #%v (%v), total duration %v", totalCount+1, exe, totalDuration)
 		if totalCount == 0 || !singlePrepare {
 			log.Printf("  preparing...")
-			failOnError(runPrepare(ctx, scenFile))
+			failOnError(runPrepare(scenFile))
 		}
 
 		log.Printf("  running...")
@@ -526,7 +533,7 @@ func runMultiple(ctx context.Context, scenFile string, timeOffset time.Duration,
 
 		totalDuration += time.Since(t0)
 		totalCount++
-		log.Printf("  completed in %v dir size: %v allocated bytes %v allocated objects: %v", rr.duration, rr.repoSizeBytes, int64(rr.go_memstats_alloc_bytes_total), int64(rr.go_memstats_mallocs_total))
+		log.Printf("  completed in %v allocated bytes %v allocated objects: %v", rr.duration, int64(rr.go_memstats_alloc_bytes_total), int64(rr.go_memstats_mallocs_total))
 	}
 
 	return runs
